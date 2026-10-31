@@ -238,6 +238,10 @@ class StorageGuard:
             with open_trusted_root(self.config.root) as trusted:
                 root_stat = os.fstat(trusted.fd)
                 marker_id, marker_version, marker_stat = _read_marker(trusted, self.config.marker_id)
+                if marker_stat.st_dev != root_stat.st_dev:
+                    raise StorageIdentityError("identity: marker device differs from root device")
+                if os.major(root_stat.st_dev) != self.config.device_major or os.minor(root_stat.st_dev) != self.config.device_minor:
+                    raise StorageIdentityError("identity: root device mismatch")
                 observed = self.adapter.observe(trusted.fd, self.config.root)
                 _check_observation(self.config, root_stat, observed)
                 return StorageSnapshot(
@@ -258,7 +262,7 @@ class StorageGuard:
             raise
         except PathSafetyError as exc:
             raise StorageIOError("root: safe descriptor access failed") from None
-        except (OSError, KeyError, TypeError, ValueError, UnicodeError, RuntimeError) as exc:
+        except Exception as exc:
             raise StorageIOError("storage identity observation failed") from None
 
     def revalidate(self, prior: StorageSnapshot) -> StorageSnapshot:
@@ -300,12 +304,12 @@ def parse_mountinfo(data: str | bytes) -> tuple[MountInfoRecord, ...]:
 
     try:
         text = data.decode("utf-8", "strict") if isinstance(data, bytes) else data
-        if not isinstance(text, str) or not text:
+        if not isinstance(text, str) or not text or not text.endswith("\n"):
             raise ValueError
         records: list[MountInfoRecord] = []
         seen_ids: set[int] = set()
-        for line in text.splitlines():
-            if not line or " - " not in line or line.count(" - ") != 1:
+        for line in text[:-1].split("\n"):
+            if not line or "\t" in line or "\r" in line or " - " not in line or line.count(" - ") != 1:
                 raise ValueError
             left_text, right_text = line.split(" - ", 1)
             left = left_text.split(" ")
@@ -320,10 +324,18 @@ def parse_mountinfo(data: str | bytes) -> tuple[MountInfoRecord, ...]:
             device = MountIdentity(_decimal(major_text), _decimal(minor_text))
             root = _decode_mountinfo(left[3])
             mount_point = _decode_mountinfo(left[4])
-            filesystem_type = right[0]
+            _decode_mountinfo(left[5])
+            for optional_field in left[6:]:
+                _validate_optional_field(optional_field)
+            filesystem_type = _decode_mountinfo(right[0])
             source = _decode_mountinfo(right[1])
             super_options = _decode_mountinfo(right[2])
-            if not root.startswith("/") or not mount_point.startswith("/") or not filesystem_type:
+            if (
+                not _is_absolute_normalized_path(root)
+                or not _is_absolute_normalized_path(mount_point)
+                or not filesystem_type
+                or not filesystem_type.strip()
+            ):
                 raise ValueError
             if mount_id in seen_ids:
                 raise ValueError
@@ -401,20 +413,64 @@ def _read_marker(trusted: object, expected_id: str) -> tuple[str, int, os.stat_r
 
 
 def _check_observation(config: StorageIdentityConfig, root_stat: os.stat_result, observed: ObservedStorageIdentity) -> None:
-    if not isinstance(observed, ObservedStorageIdentity):
+    if type(observed) is not ObservedStorageIdentity:
         raise StorageIdentityError("identity: adapter returned invalid data")
+    _validate_observed_identity(observed)
     if observed.root_device != root_stat.st_dev or observed.root_inode != root_stat.st_ino:
         raise StorageIdentityError("identity: root descriptor changed")
     if os.major(root_stat.st_dev) != config.device_major or os.minor(root_stat.st_dev) != config.device_minor:
         raise StorageIdentityError("identity: root device mismatch")
     if observed.device != MountIdentity(config.device_major, config.device_minor):
         raise StorageIdentityError("identity: mount device mismatch")
+    if observed.marker_device is not None and observed.marker_device != root_stat.st_dev:
+        raise StorageIdentityError("identity: marker device mismatch")
     if observed.filesystem_type != config.filesystem_type:
         raise StorageIdentityError("identity: filesystem type mismatch")
     if config.mount_id is not None and observed.mount_id != config.mount_id:
         raise StorageIdentityError("identity: mount identity mismatch")
-    if not isinstance(observed.mount_point, str) or not observed.mount_point.startswith("/"):
-        raise StorageIdentityError("identity: invalid mount identity")
+    if not _under_mount(config.root, observed.mount_point):
+        raise StorageIdentityError("identity: mount point does not contain configured root")
+
+
+def _validate_observed_identity(observed: ObservedStorageIdentity) -> None:
+    _validate_observed_int(observed.root_device, "root device", positive=False)
+    _validate_observed_int(observed.root_inode, "root inode", positive=True)
+    if type(observed.device) is not MountIdentity:
+        raise StorageIdentityError("identity: invalid mount device")
+    _validate_observed_int(observed.device.major, "device major", positive=False)
+    _validate_observed_int(observed.device.minor, "device minor", positive=False)
+    _validate_observed_text(observed.filesystem_type, "filesystem type")
+    _validate_observed_int(observed.mount_id, "mount ID", positive=True)
+    if type(observed.mount_point) is not str or not _is_absolute_normalized_path(observed.mount_point):
+        raise StorageIdentityError("identity: invalid mount point")
+    if observed.marker_device is not None:
+        _validate_observed_int(observed.marker_device, "marker device", positive=False)
+    if observed.marker_inode is not None:
+        _validate_observed_int(observed.marker_inode, "marker inode", positive=True)
+    if observed.marker_size is not None:
+        _validate_observed_int(observed.marker_size, "marker size", positive=False)
+
+
+def _validate_observed_int(value: object, field_name: str, *, positive: bool) -> None:
+    minimum = 1 if positive else 0
+    if type(value) is not int or value < minimum:
+        raise StorageIdentityError(f"identity: invalid {field_name}")
+
+
+def _validate_observed_text(value: object, field_name: str) -> None:
+    if type(value) is not str or not value or not value.strip() or "\x00" in value:
+        raise StorageIdentityError(f"identity: invalid {field_name}")
+
+
+def _is_absolute_normalized_path(value: str) -> bool:
+    return (
+        type(value) is str
+        and value.startswith("/")
+        and value == os.path.normpath(value)
+        and "//" not in value
+        and "\x00" not in value
+        and not any(part in {".", ".."} for part in value.split("/"))
+    )
 
 
 def _select_mount(records: tuple[MountInfoRecord, ...], root_path: str) -> MountInfoRecord:
@@ -451,6 +507,22 @@ def _decode_mountinfo(value: str) -> str:
     if "\x00" in decoded:
         raise ValueError
     return decoded
+
+
+def _validate_optional_field(value: str) -> None:
+    if not value or value.count(":") > 1:
+        raise ValueError
+    if ":" in value:
+        tag, field_value = value.split(":", 1)
+        if not _valid_mountinfo_component(tag) or not _valid_mountinfo_component(field_value):
+            raise ValueError
+    elif not _valid_mountinfo_component(value):
+        raise ValueError
+
+
+def _valid_mountinfo_component(value: str) -> bool:
+    decoded = _decode_mountinfo(value)
+    return bool(decoded)
 
 
 def _unique_pairs(pairs: list[tuple[object, object]]) -> dict[object, object]:

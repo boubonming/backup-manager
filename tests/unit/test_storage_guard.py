@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -34,6 +35,10 @@ class FakeAdapter:
         return self.observed
 
 
+class OrdinaryAdapterFailure(Exception):
+    pass
+
+
 def _setup(tmp_path: Path, marker: object = None) -> tuple[Path, StorageIdentityConfig, FakeAdapter]:
     root = tmp_path / "destination"
     root.mkdir()
@@ -53,7 +58,7 @@ def _setup(tmp_path: Path, marker: object = None) -> tuple[Path, StorageIdentity
         filesystem_type="fakefs",
         device=MountIdentity(os.major(root_stat.st_dev), os.minor(root_stat.st_dev)),
         mount_id=42,
-        mount_point="/destination",
+        mount_point="/",
     )
     config = StorageIdentityConfig(
         root=str(root),
@@ -185,6 +190,69 @@ def test_identity_mismatches_are_rejected(tmp_path: Path):
         StorageGuard(config, adapter).validate()
 
 
+@pytest.mark.parametrize("mount_id", [True, -1, "", "not-an-integer", None])
+def test_optional_mount_id_still_requires_a_valid_observed_mount_id(tmp_path: Path, mount_id: object):
+    _, config, adapter = _setup(tmp_path)
+    config = replace(config, mount_id=None)
+    adapter.observed = replace(adapter.observed, mount_id=mount_id)  # type: ignore[arg-type]
+    with pytest.raises(StorageIdentityError, match="identity:"):
+        StorageGuard(config, adapter).validate()
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("root_device", True),
+        ("root_device", -1),
+        ("root_inode", True),
+        ("root_inode", 0),
+        ("device", object()),
+        ("filesystem_type", ""),
+        ("filesystem_type", "fake\x00fs"),
+        ("mount_point", "/unrelated-mount-point"),
+        ("mount_point", "relative"),
+        ("mount_point", "//"),
+        ("mount_point", "/tmp/../destination"),
+    ],
+)
+def test_malformed_adapter_fields_are_rejected_before_snapshot(
+    tmp_path: Path, field: str, value: object
+):
+    _, config, adapter = _setup(tmp_path)
+    adapter.observed = replace(adapter.observed, **{field: value})  # type: ignore[arg-type]
+    with pytest.raises(StorageIdentityError, match="identity:"):
+        StorageGuard(config, adapter).validate()
+
+
+def test_marker_device_must_match_held_root_before_snapshot(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    import backup_manager.storage_guard as storage_guard
+
+    root, config, adapter = _setup(tmp_path)
+    root_stat = os.stat(root, follow_symlinks=False)
+    marker_stat = os.stat(root / MARKER_FILENAME, follow_symlinks=False)
+    mismatched = os.stat_result(
+        (
+            marker_stat.st_mode,
+            marker_stat.st_ino,
+            root_stat.st_dev + 1,
+            marker_stat.st_nlink,
+            marker_stat.st_uid,
+            marker_stat.st_gid,
+            marker_stat.st_size,
+            marker_stat.st_atime,
+            marker_stat.st_mtime,
+            marker_stat.st_ctime,
+        )
+    )
+    monkeypatch.setattr(
+        storage_guard,
+        "_read_marker",
+        lambda trusted, expected: (config.marker_id, 1, mismatched),
+    )
+    with pytest.raises(StorageIdentityError, match="marker device"):
+        StorageGuard(config, adapter).validate()
+
+
 def test_mountinfo_parser_decodes_escapes_and_rejects_malformed_or_ambiguous_rows():
     row = "36 25 0:42 / /tmp/hello\\040world rw - ext4 /dev/x rw"
     parsed = parse_mountinfo(row + "\n")
@@ -198,6 +266,22 @@ def test_mountinfo_parser_decodes_escapes_and_rejects_malformed_or_ambiguous_row
     ]:
         with pytest.raises(StorageIdentityError, match="malformed mountinfo"):
             parse_mountinfo(bad)
+
+
+def test_mountinfo_requires_strict_optional_fields_and_final_newline():
+    row = "36 25 0:42 / /tmp rw shared:1 unknown\\040tag:value - ext4 /dev/x rw"
+    parsed = parse_mountinfo(row + "\n")
+    assert parsed[0].mount_point == "/tmp"
+    cases = [
+        (row, False),
+        (row.replace("shared:1", "shared:"), True),
+        (row.replace("shared:1", "shared:1:extra"), True),
+        (row.replace("shared:1", "shared\\999"), True),
+        (row.replace("shared:1", ""), True),
+    ]
+    for bad, terminated in cases:
+        with pytest.raises(StorageIdentityError, match="malformed mountinfo"):
+            parse_mountinfo(bad + ("\n" if terminated else ""))
 
 
 def test_revalidation_rejects_marker_device_filesystem_mount_and_root_changes(tmp_path: Path):
@@ -226,7 +310,14 @@ def test_revalidation_rejects_marker_device_filesystem_mount_and_root_changes(tm
 def test_adapter_failures_are_wrapped_and_descriptors_do_not_leak(tmp_path: Path):
     _, config, adapter = _setup(tmp_path)
     before = len(os.listdir("/proc/self/fd"))
-    for error in [OSError("io"), RuntimeError("adapter"), KeyError("field"), ValueError("parse")]:
+    for error in [
+        OSError("io"),
+        UnicodeError("unicode"),
+        RuntimeError("adapter"),
+        KeyError("field"),
+        ValueError("parse"),
+        OrdinaryAdapterFailure("ordinary"),
+    ]:
         adapter.error = error
         with pytest.raises(StorageGuardError) as failure:
             StorageGuard(config, adapter).validate()
@@ -234,6 +325,19 @@ def test_adapter_failures_are_wrapped_and_descriptors_do_not_leak(tmp_path: Path
     adapter.error = None
     assert len(os.listdir("/proc/self/fd")) == before
     for _ in range(20):
+        StorageGuard(config, adapter).validate()
+    assert len(os.listdir("/proc/self/fd")) == before
+
+
+def test_arbitrary_adapter_exception_is_wrapped_but_control_exceptions_escape(tmp_path: Path):
+    _, config, adapter = _setup(tmp_path)
+    before = len(os.listdir("/proc/self/fd"))
+    adapter.error = Exception("ordinary")
+    with pytest.raises(StorageIOError):
+        StorageGuard(config, adapter).validate()
+    assert len(os.listdir("/proc/self/fd")) == before
+    adapter.error = SystemExit("control")
+    with pytest.raises(SystemExit):
         StorageGuard(config, adapter).validate()
     assert len(os.listdir("/proc/self/fd")) == before
 
