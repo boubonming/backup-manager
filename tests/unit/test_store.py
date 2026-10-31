@@ -85,6 +85,20 @@ def test_newer_schema_is_rejected_without_modification(tmp_path):
     assert path.read_bytes() == before
 
 
+@pytest.mark.parametrize("version", [1.5, "not-a-version"])
+def test_malformed_schema_version_is_public_error_without_modification(tmp_path, version):
+    path = tmp_path / "malformed-schema.sqlite3"
+    with Store(path):
+        pass
+    with sqlite3.connect(path) as connection:
+        connection.execute("UPDATE schema_version SET version = ? WHERE id = 1", (version,))
+        connection.commit()
+    before = path.read_bytes()
+    with pytest.raises(StoreMigrationError, match="invalid schema version"):
+        Store(path)
+    assert path.read_bytes() == before
+
+
 def test_job_revisions_round_trip_and_stale_update_is_atomic(tmp_path):
     path = tmp_path / "jobs.sqlite3"
     with Store(path) as store:
@@ -127,6 +141,45 @@ def test_run_state_machine_and_utc_timestamps(tmp_path):
         with pytest.raises(StoreTransitionError):
             store.transition_run(run.run_id, "succeeded")
         assert store.get_run(run.run_id) == finished
+
+
+def test_run_transition_matrix_rejects_every_other_edge_without_mutation(tmp_path):
+    states = {"queued", "running", "succeeded", "failed", "partial", "cancelled"}
+    terminals = {"succeeded", "failed", "partial", "cancelled"}
+    with Store(tmp_path / "run-matrix.sqlite3") as store:
+        created = store.create_job(job())
+        queued = store.create_run(created.job_id, 1, trigger="matrix")
+        assert queued.started_at is None
+        assert queued.ended_at is None
+        for target in states - {"running"}:
+            before = store.get_run(queued.run_id)
+            with pytest.raises(StoreTransitionError):
+                store.transition_run(queued.run_id, target)
+            assert store.get_run(queued.run_id) == before
+
+        running = store.transition_run(queued.run_id, "running")
+        assert running.started_at is not None
+        assert running.ended_at is None
+        for target in {"queued", "running"}:
+            before = store.get_run(queued.run_id)
+            with pytest.raises(StoreTransitionError):
+                store.transition_run(queued.run_id, target)
+            assert store.get_run(queued.run_id) == before
+
+        for terminal in terminals:
+            candidate = store.create_run(created.job_id, 1, trigger="matrix")
+            store.transition_run(candidate.run_id, "running")
+            error = None if terminal == "succeeded" else f"{terminal} error"
+            finished = store.transition_run(candidate.run_id, terminal, error_summary=error)
+            assert finished.state == terminal
+            assert finished.started_at is not None
+            assert finished.ended_at is not None
+            assert finished.error_summary == error
+            for target in states:
+                before = store.get_run(candidate.run_id)
+                with pytest.raises(StoreTransitionError):
+                    store.transition_run(candidate.run_id, target)
+                assert store.get_run(candidate.run_id) == before
 
 
 def test_file_identity_is_unique_and_distinguishes_path_and_content(tmp_path):
@@ -179,6 +232,7 @@ def test_journal_transitions_and_tombstones_survive_reopen(tmp_path):
             source_length=10,
             source_mtime_ns=20,
         )
+        run = store.create_run(created.job_id, 1, trigger="manual")
         with pytest.raises(StoreTransitionError):
             store.transition_file(record.file_id, "published")
         record = store.transition_file(record.file_id, "verified")
@@ -188,6 +242,7 @@ def test_journal_transitions_and_tombstones_survive_reopen(tmp_path):
             destination_relative_path="palworld/a.zip",
             destination_sha256="b" * 64,
             destination_length=10,
+            publishing_run_id=run.run_id,
             retention_order=1,
         )
         record = store.transition_file(record.file_id, "pending_delete")
@@ -201,6 +256,116 @@ def test_journal_transitions_and_tombstones_survive_reopen(tmp_path):
         assert reopened.count_files(created.job_id) == 1
         with pytest.raises(StoreTransitionError):
             reopened.transition_file(found.file_id, "published")
+
+
+def test_file_transition_matrix_rejects_every_other_edge_without_mutation(tmp_path):
+    states = {"staged", "verified", "published", "pending_delete", "pruned"}
+    next_state = {
+        "staged": "verified",
+        "verified": "published",
+        "published": "pending_delete",
+        "pending_delete": "pruned",
+    }
+    with Store(tmp_path / "file-matrix.sqlite3") as store:
+        created = store.create_job(job())
+        run = store.create_run(created.job_id, 1, trigger="manual")
+        record = store.create_file(
+            created.job_id,
+            "matrix.zip",
+            source_sha256="a" * 64,
+            source_length=10,
+            source_mtime_ns=20,
+        )
+        for source in ("staged", "verified", "published", "pending_delete", "pruned"):
+            allowed = next_state.get(source)
+            for target in states - ({allowed} if allowed else set()):
+                before = store.get_file(record.file_id)
+                with pytest.raises(StoreTransitionError):
+                    store.transition_file(record.file_id, target)
+                assert store.get_file(record.file_id) == before
+            if allowed is None:
+                break
+            if allowed == "published":
+                record = store.transition_file(
+                    record.file_id,
+                    allowed,
+                    destination_relative_path="palworld/matrix.zip",
+                    destination_sha256="b" * 64,
+                    destination_length=10,
+                    publishing_run_id=run.run_id,
+                    retention_order=1,
+                )
+            else:
+                record = store.transition_file(record.file_id, allowed)
+
+
+def test_publication_requires_complete_same_job_metadata_and_is_immutable(tmp_path):
+    with Store(tmp_path / "publication-integrity.sqlite3") as store:
+        first = store.create_job(job())
+        second = store.create_job(job(interval=True))
+        run = store.create_run(first.job_id, 1, trigger="manual")
+        foreign_run = store.create_run(second.job_id, 1, trigger="manual")
+        record = store.create_file(
+            first.job_id,
+            "integrity.zip",
+            source_sha256="a" * 64,
+            source_length=10,
+            source_mtime_ns=20,
+        )
+        store.transition_file(record.file_id, "verified")
+        before = store.get_file(record.file_id)
+        with pytest.raises(StoreValidationError, match="publication metadata"):
+            store.transition_file(record.file_id, "published")
+        assert store.get_file(record.file_id) == before
+        with pytest.raises(StoreConflictError, match="different job"):
+            store.transition_file(
+                record.file_id,
+                "published",
+                destination_relative_path="palworld/integrity.zip",
+                destination_sha256="b" * 64,
+                destination_length=10,
+                publishing_run_id=foreign_run.run_id,
+                retention_order=1,
+            )
+        assert store.get_file(record.file_id) == before
+        record = store.transition_file(
+            record.file_id,
+            "published",
+            destination_relative_path="palworld/integrity.zip",
+            destination_sha256="b" * 64,
+            destination_length=10,
+            publishing_run_id=run.run_id,
+            retention_order=1,
+        )
+        metadata = (
+            record.destination_relative_path,
+            record.destination_sha256,
+            record.destination_length,
+            record.publishing_run_id,
+            record.retention_order,
+        )
+        for state in ("pending_delete", "pruned"):
+            target = "pending_delete" if state == "pending_delete" else "pruned"
+            before = store.get_file(record.file_id)
+            with pytest.raises(StoreTransitionError, match="immutable"):
+                store.transition_file(
+                    record.file_id,
+                    target,
+                    destination_relative_path="other.zip",
+                    destination_sha256="c" * 64,
+                    destination_length=20,
+                    publishing_run_id=run.run_id,
+                    retention_order=2,
+                )
+            assert store.get_file(record.file_id) == before
+            record = store.transition_file(record.file_id, target)
+            assert (
+                record.destination_relative_path,
+                record.destination_sha256,
+                record.destination_length,
+                record.publishing_run_id,
+                record.retention_order,
+            ) == metadata
 
 
 def test_unknown_entities_have_stable_public_errors(tmp_path):

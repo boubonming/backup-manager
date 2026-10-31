@@ -273,12 +273,18 @@ class Store:
 
     @property
     def schema_version(self) -> int:
-        row = self._connection.execute(
-            "SELECT version FROM schema_version WHERE id = 1"
-        ).fetchone()
+        try:
+            row = self._connection.execute(
+                "SELECT version FROM schema_version WHERE id = 1"
+            ).fetchone()
+        except sqlite3.Error:
+            raise StoreMigrationError("could not read schema version") from None
         if row is None:
             raise StoreMigrationError("schema version row is missing")
-        return int(row[0])
+        version = row[0]
+        if type(version) is not int or version < 0:
+            raise StoreMigrationError("invalid schema version")
+        return version
 
     def _migrate(self) -> None:
         table = self._connection.execute(
@@ -630,6 +636,8 @@ class Store:
 
     @staticmethod
     def _validate_publishing_run(connection: sqlite3.Connection, job_id: str, run_id: str) -> None:
+        if not isinstance(run_id, str) or not run_id:
+            raise StoreValidationError("publishing_run_id: must be a non-empty string")
         row = connection.execute("SELECT job_id FROM runs WHERE run_id = ?", (run_id,)).fetchone()
         if row is None:
             raise StoreNotFoundError(f"run '{run_id}' not found")
@@ -700,6 +708,62 @@ class Store:
             if allowed != state:
                 raise StoreTransitionError(
                     f"file {file_id} transition from '{current}' to '{state}' is not allowed"
+                )
+            if state in {"pending_delete", "pruned"} and any(
+                value is not None
+                for value in (
+                    destination_relative_path,
+                    destination_sha256,
+                    destination_length,
+                    publishing_run_id,
+                    retention_order,
+                )
+            ):
+                raise StoreTransitionError(
+                    "publication metadata is immutable after publication"
+                )
+            if state == "published":
+                final_destination_path = (
+                    destination_relative_path
+                    if destination_relative_path is not None
+                    else row["destination_relative_path"]
+                )
+                final_destination_sha256 = (
+                    destination_sha256
+                    if destination_sha256 is not None
+                    else row["destination_sha256"]
+                )
+                final_destination_length = (
+                    destination_length
+                    if destination_length is not None
+                    else row["destination_length"]
+                )
+                final_publishing_run_id = (
+                    publishing_run_id
+                    if publishing_run_id is not None
+                    else row["publishing_run_id"]
+                )
+                final_retention_order = (
+                    retention_order
+                    if retention_order is not None
+                    else row["retention_order"]
+                )
+                if (
+                    final_destination_path is None
+                    or final_destination_sha256 is None
+                    or final_destination_length is None
+                    or final_publishing_run_id is None
+                    or final_retention_order is None
+                ):
+                    raise StoreValidationError(
+                        "publication metadata: all fields are required"
+                    )
+                _relative_path("destination_relative_path", final_destination_path)
+                _sha256("destination_sha256", final_destination_sha256)
+                _strict_nonnegative_int("destination_length", final_destination_length)
+                _strict_nonnegative_int("retention_order", final_retention_order)
+                self._validate_publishing_run(
+                    connection, row["job_id"], final_publishing_run_id
                 )
             if publishing_run_id is not None:
                 self._validate_publishing_run(connection, row["job_id"], publishing_run_id)
