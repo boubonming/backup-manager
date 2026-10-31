@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools==84.2.1", "wheel==0.48.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "backup-manager"
+version = "0.1.0"
+description = "A safe, auditable backup manager."
+requires-python = ">=3.11"
+dependencies = [
+    "Flask==3.1.3",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest==9.2.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
