@@ -243,7 +243,7 @@ class StorageGuard:
                 if os.major(root_stat.st_dev) != self.config.device_major or os.minor(root_stat.st_dev) != self.config.device_minor:
                     raise StorageIdentityError("identity: root device mismatch")
                 observed = self.adapter.observe(trusted.fd, self.config.root)
-                _check_observation(self.config, root_stat, observed)
+                _check_observation(self.config, root_stat, marker_stat, observed)
                 return StorageSnapshot(
                     root=self.config.root,
                     marker_id=marker_id,
@@ -412,7 +412,12 @@ def _read_marker(trusted: object, expected_id: str) -> tuple[str, int, os.stat_r
             raise StorageIOError("storage I/O failure while closing marker") from None
 
 
-def _check_observation(config: StorageIdentityConfig, root_stat: os.stat_result, observed: ObservedStorageIdentity) -> None:
+def _check_observation(
+    config: StorageIdentityConfig,
+    root_stat: os.stat_result,
+    marker_stat: os.stat_result,
+    observed: ObservedStorageIdentity,
+) -> None:
     if type(observed) is not ObservedStorageIdentity:
         raise StorageIdentityError("identity: adapter returned invalid data")
     _validate_observed_identity(observed)
@@ -424,6 +429,12 @@ def _check_observation(config: StorageIdentityConfig, root_stat: os.stat_result,
         raise StorageIdentityError("identity: mount device mismatch")
     if observed.marker_device is not None and observed.marker_device != root_stat.st_dev:
         raise StorageIdentityError("identity: marker device mismatch")
+    if observed.marker_device is not None and observed.marker_device != marker_stat.st_dev:
+        raise StorageIdentityError("identity: marker device mismatch")
+    if observed.marker_inode is not None and observed.marker_inode != marker_stat.st_ino:
+        raise StorageIdentityError("identity: marker inode mismatch")
+    if observed.marker_size is not None and observed.marker_size != marker_stat.st_size:
+        raise StorageIdentityError("identity: marker size mismatch")
     if observed.filesystem_type != config.filesystem_type:
         raise StorageIdentityError("identity: filesystem type mismatch")
     if config.mount_id is not None and observed.mount_id != config.mount_id:

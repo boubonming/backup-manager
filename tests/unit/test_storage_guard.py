@@ -209,6 +209,12 @@ def test_optional_mount_id_still_requires_a_valid_observed_mount_id(tmp_path: Pa
         ("device", object()),
         ("filesystem_type", ""),
         ("filesystem_type", "fake\x00fs"),
+        ("marker_device", True),
+        ("marker_device", -1),
+        ("marker_inode", True),
+        ("marker_inode", 0),
+        ("marker_size", True),
+        ("marker_size", -1),
         ("mount_point", "/unrelated-mount-point"),
         ("mount_point", "relative"),
         ("mount_point", "//"),
@@ -266,6 +272,48 @@ def test_mountinfo_parser_decodes_escapes_and_rejects_malformed_or_ambiguous_row
     ]:
         with pytest.raises(StorageIdentityError, match="malformed mountinfo"):
             parse_mountinfo(bad)
+
+
+@pytest.mark.parametrize("field", ["marker_device", "marker_inode", "marker_size"])
+def test_supplied_marker_identity_must_match_descriptor_stat(tmp_path: Path, field: str):
+    root, config, adapter = _setup(tmp_path)
+    marker_stat = os.stat(root / MARKER_FILENAME, follow_symlinks=False)
+    supplied = {
+        "marker_device": marker_stat.st_dev,
+        "marker_inode": marker_stat.st_ino,
+        "marker_size": marker_stat.st_size,
+    }
+    supplied[field] += 1
+    adapter.observed = replace(adapter.observed, **supplied)
+
+    with pytest.raises(StorageIdentityError, match="identity:"):
+        StorageGuard(config, adapter).validate()
+
+
+def test_supplied_marker_identity_matching_descriptor_stat_is_accepted(tmp_path: Path):
+    root, config, adapter = _setup(tmp_path)
+    marker_stat = os.stat(root / MARKER_FILENAME, follow_symlinks=False)
+    adapter.observed = replace(
+        adapter.observed,
+        marker_device=marker_stat.st_dev,
+        marker_inode=marker_stat.st_ino,
+        marker_size=marker_stat.st_size,
+    )
+
+    snapshot = StorageGuard(config, adapter).validate()
+
+    assert snapshot.marker_device == marker_stat.st_dev
+    assert snapshot.marker_inode == marker_stat.st_ino
+    assert snapshot.marker_size == marker_stat.st_size
+
+
+def test_marker_optional_identity_none_preserves_successful_path(tmp_path: Path):
+    _, config, adapter = _setup(tmp_path)
+
+    snapshot = StorageGuard(config, adapter).validate()
+
+    assert snapshot.marker_inode > 0
+    assert snapshot.marker_size >= 0
 
 
 def test_mountinfo_requires_strict_optional_fields_and_final_newline():
