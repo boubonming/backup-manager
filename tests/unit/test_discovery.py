@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import os
 import socket
 import time
@@ -8,11 +9,13 @@ from pathlib import Path
 
 import pytest
 
+from backup_manager import discovery as discovery_module
 from backup_manager.discovery import (
     DiscoveryConfigError,
     DiscoveryPolicy,
     DiscoverySourceError,
     DiscoveryCandidate,
+    DiscoveryIssue,
     DiscoveryResult,
     discover_completed_files,
 )
@@ -97,9 +100,10 @@ def test_recursive_directory_pruning_during_scan_is_unhealthy(tmp_path: Path):
     nested.mkdir(parents=True)
     _write_zip(nested / "backup.zip")
 
-    def prune_directory(_path: str, _fd: int) -> None:
+    def prune_directory(_path: str) -> None:
         nested.rename(source / "pruned")
 
+    before = len(os.listdir("/proc/self/fd"))
     result = _discover(
         root,
         DiscoveryPolicy(include_patterns=("*.zip",), recursive=True),
@@ -108,6 +112,7 @@ def test_recursive_directory_pruning_during_scan_is_unhealthy(tmp_path: Path):
     assert result.candidates == ()
     assert result.healthy is False
     assert any(issue.code == "race" and issue.relative_path == "nested" for issue in result.issues)
+    assert len(os.listdir("/proc/self/fd")) == before
 
 
 def test_age_boundary_and_future_mtime_use_injected_now(tmp_path: Path):
@@ -198,7 +203,7 @@ def test_append_truncate_replace_and_mtime_mutations_are_unhealthy(tmp_path: Pat
     archive = source / "backup.zip"
     archive.write_bytes(b"stable")
 
-    def mutate(_path: str, _fd: int) -> None:
+    def mutate(_path: str) -> None:
         if mutation == "append":
             with archive.open("ab") as stream:
                 stream.write(b"changed")
@@ -222,14 +227,111 @@ def test_pruning_between_enumeration_and_open_is_a_public_issue(tmp_path: Path):
     source.mkdir(parents=True)
     archive = source / "backup.zip"
     archive.write_bytes(b"data")
+    before = len(os.listdir("/proc/self/fd"))
 
-    def prune(_path: str, _parent_fd: int) -> None:
+    def prune(_path: str) -> None:
         archive.unlink()
 
     result = _discover(root, DiscoveryPolicy(include_patterns=("*.zip",)), before_open=prune)
     assert result.candidates == ()
     assert result.healthy is False
     assert result.issues[0].code == "vanished"
+    assert len(os.listdir("/proc/self/fd")) == before
+
+
+def test_before_open_callback_failure_is_generic_and_restores_fd_baseline(tmp_path: Path):
+    root = tmp_path / "approved"
+    source = root / "backups"
+    source.mkdir(parents=True)
+    (source / "backup.zip").write_bytes(b"data")
+    before = len(os.listdir("/proc/self/fd"))
+
+    def explode(_path: str) -> None:
+        raise RuntimeError("raw callback secret")
+
+    result = _discover(root, DiscoveryPolicy(include_patterns=("*.zip",)), before_open=explode)
+    assert result.healthy is False
+    assert result.issues[0].code == "hook_failure"
+    assert "raw callback secret" not in result.issues[0].message
+    assert len(os.listdir("/proc/self/fd")) == before
+
+
+@pytest.mark.parametrize(
+    ("errno_value", "expected_code"),
+    [(errno.EACCES, "permission"), (errno.EIO, "io_error")],
+)
+def test_candidate_open_failures_are_relative_generic_issues_and_restore_fd_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, errno_value: int, expected_code: str
+):
+    root = tmp_path / "approved"
+    source = root / "backups"
+    source.mkdir(parents=True)
+    (source / "backup.zip").write_bytes(b"data")
+    before = len(os.listdir("/proc/self/fd"))
+
+    def fail_open(_parent_fd: int, _name: str) -> int:
+        raise OSError(errno_value, "raw secret /host/path")
+
+    monkeypatch.setattr(discovery_module, "_open_candidate", fail_open)
+    result = _discover(root, DiscoveryPolicy(include_patterns=("*.zip",)))
+    assert result.healthy is False
+    assert result.candidates == ()
+    assert [(issue.code, issue.relative_path) for issue in result.issues] == [(expected_code, "backup.zip")]
+    assert result.issues[0].message == discovery_module._ISSUE_MESSAGES[expected_code]
+    assert "raw secret" not in result.issues[0].message
+    assert len(os.listdir("/proc/self/fd")) == before
+
+
+def test_callbacks_receive_only_relative_path_and_cannot_corrupt_owned_descriptors(tmp_path: Path):
+    root = tmp_path / "approved"
+    source = root / "backups"
+    source.mkdir(parents=True)
+    (source / "backup.zip").write_bytes(b"data")
+    before = len(os.listdir("/proc/self/fd"))
+    received: list[tuple[object, ...]] = []
+
+    def adversary(*args: object) -> None:
+        received.append(args)
+        if len(args) > 1:
+            os.close(args[1])  # type: ignore[arg-type]
+        raise RuntimeError("callback secret")
+
+    result = _discover(root, DiscoveryPolicy(include_patterns=("*.zip",)), between_observations=adversary)
+    assert received == [("backup.zip",)]
+    assert result.healthy is False
+    assert result.issues[0].code == "hook_failure"
+    assert "callback secret" not in result.issues[0].message
+    assert len(os.listdir("/proc/self/fd")) == before
+
+
+def test_before_open_callback_receives_only_relative_path(tmp_path: Path):
+    root = tmp_path / "approved"
+    source = root / "backups"
+    source.mkdir(parents=True)
+    (source / "backup.zip").write_bytes(b"data")
+    received: list[tuple[object, ...]] = []
+
+    def callback(*args: object) -> None:
+        received.append(args)
+
+    result = _discover(root, DiscoveryPolicy(include_patterns=("*.zip",)), before_open=callback)
+    assert received == [("backup.zip",)]
+    assert result.healthy is True
+
+
+def test_success_and_corrupt_zip_restore_exact_fd_baseline(tmp_path: Path):
+    root = tmp_path / "approved"
+    source = root / "backups"
+    source.mkdir(parents=True)
+    archive = source / "backup.zip"
+    _write_zip(archive)
+    before = len(os.listdir("/proc/self/fd"))
+    assert _discover(root, DiscoveryPolicy(include_patterns=("*.zip",), validate_completed_zips=True)).healthy
+    assert len(os.listdir("/proc/self/fd")) == before
+    archive.write_bytes(b"not a zip")
+    result = _discover(root, DiscoveryPolicy(include_patterns=("*.zip",), validate_completed_zips=True))
+    assert result.healthy is False
+    assert len(os.listdir("/proc/self/fd")) == before
 
 
 def test_hook_exception_and_descriptor_cleanup_are_stable(tmp_path: Path):
@@ -240,14 +342,50 @@ def test_hook_exception_and_descriptor_cleanup_are_stable(tmp_path: Path):
         (source / f"{index}.zip").write_bytes(b"data")
     before = len(os.listdir("/proc/self/fd"))
 
-    def explode(_path: str, _fd: int) -> None:
+    def explode(_path: str) -> None:
         raise RuntimeError("secret path should not escape")
 
     for _ in range(20):
         result = _discover(root, DiscoveryPolicy(include_patterns=("*.zip",)), between_observations=explode)
         assert result.healthy is False
         assert all("secret" not in issue.message for issue in result.issues)
-    assert len(os.listdir("/proc/self/fd")) <= before + 1
+    assert len(os.listdir("/proc/self/fd")) == before
+
+
+@pytest.mark.parametrize("exception_type", [KeyboardInterrupt, SystemExit, GeneratorExit])
+def test_before_open_process_control_propagates_and_restores_fd_baseline(
+    tmp_path: Path, exception_type: type[BaseException]
+):
+    root = tmp_path / "approved"
+    source = root / "backups"
+    source.mkdir(parents=True)
+    (source / "backup.zip").write_bytes(b"data")
+    before = len(os.listdir("/proc/self/fd"))
+
+    def stop(_path: str) -> None:
+        raise exception_type("stop")
+
+    with pytest.raises(exception_type):
+        _discover(root, DiscoveryPolicy(include_patterns=("*.zip",)), before_open=stop)
+    assert len(os.listdir("/proc/self/fd")) == before
+
+
+@pytest.mark.parametrize("exception_type", [KeyboardInterrupt, SystemExit, GeneratorExit])
+def test_between_observations_process_control_propagates_and_restores_fd_baseline(
+    tmp_path: Path, exception_type: type[BaseException]
+):
+    root = tmp_path / "approved"
+    source = root / "backups"
+    source.mkdir(parents=True)
+    (source / "backup.zip").write_bytes(b"data")
+    before = len(os.listdir("/proc/self/fd"))
+
+    def stop(_path: str) -> None:
+        raise exception_type("stop")
+
+    with pytest.raises(exception_type):
+        _discover(root, DiscoveryPolicy(include_patterns=("*.zip",)), between_observations=stop)
+    assert len(os.listdir("/proc/self/fd")) == before
 
 
 def test_hostile_names_are_not_line_delimited(tmp_path: Path):
@@ -296,6 +434,38 @@ def test_public_observation_models_reject_mutable_or_authorizing_shapes():
     with pytest.raises(DiscoveryConfigError):
         DiscoveryResult((candidate,), (), (), 1)  # type: ignore[arg-type]
     assert candidate.non_authorizing is True
+
+
+@pytest.mark.parametrize(
+    "device,inode,byte_length,mtime_ns",
+    [(-1, 2, 0, 0), (1, -2, 0, 0), (True, 2, 0, 0), (1, False, 0, 0), (1, 2, -1, 0), (1, 2, 0, -1)],
+)
+def test_candidate_rejects_malformed_identity_and_metadata(
+    device: object, inode: object, byte_length: object, mtime_ns: object
+):
+    with pytest.raises(DiscoveryConfigError):
+        DiscoveryCandidate("file.zip", device, inode, byte_length, mtime_ns)  # type: ignore[arg-type]
+
+
+def test_issue_constructor_rejects_unknown_or_non_generic_message():
+    with pytest.raises(DiscoveryConfigError):
+        DiscoveryIssue("unknown", "file.zip", "unsafe")
+    with pytest.raises(DiscoveryConfigError):
+        DiscoveryIssue("io_error", "file.zip", "/absolute/host/path secret")
+    with pytest.raises(DiscoveryConfigError):
+        DiscoveryIssue("io_error", "file.zip", "raw secret\ntraceback")
+
+
+def test_public_error_surface_exposes_only_shipped_error_contracts():
+    assert "DiscoveryError" in discovery_module.__all__
+    assert "DiscoveryConfigError" in discovery_module.__all__
+    assert "DiscoverySourceError" in discovery_module.__all__
+    assert "DiscoveryIOError" not in discovery_module.__all__
+    assert "DiscoveryUncertaintyError" not in discovery_module.__all__
+    assert "DiscoveryZipError" not in discovery_module.__all__
+    assert not hasattr(discovery_module, "DiscoveryIOError")
+    assert not hasattr(discovery_module, "DiscoveryUncertaintyError")
+    assert not hasattr(discovery_module, "DiscoveryZipError")
 
 
 def test_no_files_are_created_changed_or_deleted(tmp_path: Path):

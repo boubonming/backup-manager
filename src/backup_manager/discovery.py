@@ -30,7 +30,11 @@ from .paths import (
 )
 
 class DiscoveryError(ValueError):
-    """Base class for stable public discovery failures."""
+    """Base for whole-operation configuration and source failures.
+
+    Per-entry I/O, race, callback, and ZIP uncertainty is represented by a
+    generic :class:`DiscoveryIssue` instead of being raised.
+    """
 
 
 class DiscoveryConfigError(DiscoveryError):
@@ -41,16 +45,20 @@ class DiscoverySourceError(DiscoveryError):
     """The configured source root or source directory cannot be opened safely."""
 
 
-class DiscoveryIOError(DiscoveryError):
-    """An expected filesystem operation failed without a safe observation."""
-
-
-class DiscoveryUncertaintyError(DiscoveryError):
-    """A filesystem race or injected observation failure prevented certainty."""
-
-
-class DiscoveryZipError(DiscoveryError):
+class _DiscoveryZipError(DiscoveryError):
     """A completed ZIP could not be validated."""
+
+
+_ISSUE_MESSAGES = {
+    "vanished": "directory entry disappeared",
+    "permission": "candidate could not be opened safely",
+    "symlink": "symlink entries are not eligible",
+    "io_error": "filesystem operation failed safely",
+    "race": "candidate changed during observation",
+    "special_file": "candidate is not a regular file",
+    "hook_failure": "discovery callback failed",
+    "zip_invalid": "completed ZIP validation failed",
+}
 
 
 def _patterns(value: object, field: str) -> tuple[str, ...]:
@@ -142,12 +150,17 @@ class DiscoveryCandidate:
             normalized = normalize_relative_path(self.relative_path, field="relative_path")
         except PathGrammarError:
             raise DiscoveryConfigError("relative_path: must be a safe relative POSIX path") from None
-        if type(self.device) is not int or type(self.inode) is not int:
-            raise DiscoveryConfigError("candidate identity: device and inode must be integers")
+        if (
+            type(self.device) is not int
+            or type(self.inode) is not int
+            or self.device < 0
+            or self.inode < 0
+        ):
+            raise DiscoveryConfigError("candidate identity: device and inode must be non-negative integers")
         if type(self.byte_length) is not int or self.byte_length < 0:
             raise DiscoveryConfigError("byte_length: must be a non-negative integer")
-        if type(self.mtime_ns) is not int:
-            raise DiscoveryConfigError("mtime_ns: must be an integer")
+        if type(self.mtime_ns) is not int or self.mtime_ns < 0:
+            raise DiscoveryConfigError("mtime_ns: must be a non-negative integer")
         object.__setattr__(self, "relative_path", normalized)
 
     @property
@@ -179,12 +192,10 @@ class DiscoveryIssue:
             normalized = normalize_relative_path(self.relative_path, field="relative_path")
         except PathGrammarError:
             raise DiscoveryConfigError("relative_path: must be a safe relative POSIX path") from None
-        if type(self.code) is not str or not self.code or "\x00" in self.code:
-            raise DiscoveryConfigError("issue code: must be non-empty text")
-        if type(self.message) is not str or not self.message or "\x00" in self.message:
-            raise DiscoveryConfigError("issue message: must be non-empty text")
-        if self.message.startswith("/"):
-            raise DiscoveryConfigError("issue message: must not contain an absolute path")
+        if type(self.code) is not str or self.code not in _ISSUE_MESSAGES:
+            raise DiscoveryConfigError("issue code: unknown issue category")
+        if self.message != _ISSUE_MESSAGES[self.code]:
+            raise DiscoveryConfigError("issue message: must use the generic category message")
         object.__setattr__(self, "relative_path", normalized)
 
 
@@ -281,8 +292,8 @@ def _excluded(path: str, patterns: tuple[str, ...]) -> bool:
     )
 
 
-def _issue(code: str, path: str, message: str) -> DiscoveryIssue:
-    return DiscoveryIssue(code, path, message)
+def _issue(code: str, path: str, _detail: str = "") -> DiscoveryIssue:
+    return DiscoveryIssue(code, path, _ISSUE_MESSAGES[code])
 
 
 def _errno_code(exc: OSError) -> str:
@@ -305,9 +316,9 @@ def _open_candidate(parent_fd: int, name: str) -> int:
     return os.open(name, flags, dir_fd=parent_fd)
 
 
-def _invoke_hook(hook: Callable[[str, int], object] | None, path: str, fd: int) -> None:
+def _invoke_hook(hook: Callable[[str], object] | None, path: str) -> None:
     if hook is not None:
-        hook(path, fd)
+        hook(path)
 
 
 def _validate_zip(fd: int) -> None:
@@ -318,11 +329,11 @@ def _validate_zip(fd: int) -> None:
             duplicate = -1
             with zipfile.ZipFile(stream) as archive:
                 if archive.testzip() is not None:
-                    raise DiscoveryZipError("zip validation failed")
-    except DiscoveryZipError:
+                    raise _DiscoveryZipError("zip validation failed")
+    except _DiscoveryZipError:
         raise
     except (OSError, EOFError, RuntimeError, ValueError, zipfile.BadZipFile, zipfile.LargeZipFile):
-        raise DiscoveryZipError("zip validation failed") from None
+        raise _DiscoveryZipError("zip validation failed") from None
     finally:
         if duplicate >= 0:
             os.close(duplicate)
@@ -349,15 +360,15 @@ def _candidate_for_file(
     pre_open: _ObservedStat,
     policy: DiscoveryPolicy,
     now_ns: int,
-    before_open: Callable[[str, int], object] | None,
-    hook: Callable[[str, int], object] | None,
+    before_open: Callable[[str], object] | None,
+    hook: Callable[[str], object] | None,
     issues: list[DiscoveryIssue],
     skips: list[DiscoverySkip],
 ) -> DiscoveryCandidate | None:
     try:
         if before_open is not None:
-            before_open(relative_path, parent_fd)
-    except BaseException:
+            before_open(relative_path)
+    except Exception:
         issues.append(_issue("hook_failure", relative_path, "discovery hook failed"))
         return None
     try:
@@ -384,12 +395,12 @@ def _candidate_for_file(
             return None
         validation_error: str | None = None
         try:
-            _invoke_hook(hook, relative_path, fd)
+            _invoke_hook(hook, relative_path)
             if policy.validate_completed_zips and relative_path.endswith(".zip"):
                 _validate_zip(fd)
-        except DiscoveryZipError:
+        except _DiscoveryZipError:
             validation_error = "zip_invalid"
-        except BaseException:
+        except Exception:
             validation_error = "hook_failure"
         try:
             second = _ObservedStat.from_fd(fd)
@@ -432,8 +443,8 @@ def _scan_directory(
     relative_directory: str,
     policy: DiscoveryPolicy,
     now_ns: int,
-    before_open: Callable[[str, int], object] | None,
-    hook: Callable[[str, int], object] | None,
+    before_open: Callable[[str], object] | None,
+    hook: Callable[[str], object] | None,
     candidates: list[DiscoveryCandidate],
     issues: list[DiscoveryIssue],
     skips: list[DiscoverySkip],
@@ -527,19 +538,22 @@ def discover_completed_files(
     policy: DiscoveryPolicy,
     *,
     now_ns: object = None,
-    before_open: Callable[[str, int], object] | None = None,
-    between_observations: Callable[[str, int], object] | None = None,
-    observation_hook: Callable[[str, int], object] | None = None,
+    before_open: Callable[[str], object] | None = None,
+    between_observations: Callable[[str], object] | None = None,
+    observation_hook: Callable[[str], object] | None = None,
 ) -> DiscoveryResult:
     """Discover stable, eligible files beneath one approved source subtree.
 
-    ``between_observations`` is a deterministic test seam and receives the
-    relative path and held descriptor after the first stat and before optional
-    ZIP validation.  It is not used by production callers.  An exception from
-    it makes the result unhealthy and is never exposed verbatim.
+    ``between_observations`` is a deterministic test seam and receives only the
+    relative path after the first stat and before optional ZIP validation.  It
+    is not used by production callers.  An ordinary exception from it makes
+    the result unhealthy and is never exposed verbatim.  Process-control
+    exceptions propagate to the caller.
 
-    ``before_open`` is a deterministic test seam called after non-authorizing
-    enumeration metadata and immediately before the descriptor-relative open.
+    ``before_open`` is a deterministic test seam called with only the relative
+    path after non-authorizing enumeration metadata and immediately before the
+    descriptor-relative open.  Discovery never lends owned descriptors to
+    callback code.
     """
     if not isinstance(policy, DiscoveryPolicy):
         raise DiscoveryConfigError("policy: must be a DiscoveryPolicy")
@@ -597,14 +611,11 @@ __all__ = [
     "DiscoveryConfig",
     "DiscoveryConfigError",
     "DiscoveryError",
-    "DiscoveryIOError",
     "DiscoveryIssue",
     "DiscoveryPolicy",
     "DiscoveryResult",
     "DiscoverySkip",
     "DiscoverySourceError",
-    "DiscoveryUncertaintyError",
-    "DiscoveryZipError",
     "discover",
     "discover_completed_files",
     "discover_files",
