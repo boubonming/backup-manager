@@ -159,8 +159,8 @@ class DiscoveryCandidate:
             raise DiscoveryConfigError("candidate identity: device and inode must be non-negative integers")
         if type(self.byte_length) is not int or self.byte_length < 0:
             raise DiscoveryConfigError("byte_length: must be a non-negative integer")
-        if type(self.mtime_ns) is not int or self.mtime_ns < 0:
-            raise DiscoveryConfigError("mtime_ns: must be a non-negative integer")
+        if type(self.mtime_ns) is not int:
+            raise DiscoveryConfigError("mtime_ns: must be an integer")
         object.__setattr__(self, "relative_path", normalized)
 
     @property

@@ -132,6 +132,61 @@ def test_age_boundary_and_future_mtime_use_injected_now(tmp_path: Path):
     assert _discover(root, policy, now_ns=10_000_000_000).skips[0].code == "future_mtime"
 
 
+def test_pre_epoch_mtime_is_eligible_at_exact_minimum_age_boundary(tmp_path: Path):
+    root = tmp_path / "approved"
+    source = root / "backups"
+    source.mkdir(parents=True)
+    archive = source / "backup.zip"
+    archive.write_bytes(b"data")
+    os.utime(archive, ns=(-1, -1))
+    assert archive.stat().st_mtime_ns == -1
+    policy = DiscoveryPolicy(include_patterns=("*.zip",), minimum_age_seconds=2)
+
+    result = _discover(root, policy, now_ns=-1 + 2_000_000_000)
+
+    assert result.healthy is True
+    assert [candidate.mtime_ns for candidate in result.candidates] == [-1]
+
+
+def test_pre_epoch_mtime_one_nanosecond_under_minimum_age_is_too_young(tmp_path: Path):
+    root = tmp_path / "approved"
+    source = root / "backups"
+    source.mkdir(parents=True)
+    archive = source / "backup.zip"
+    archive.write_bytes(b"data")
+    os.utime(archive, ns=(-1, -1))
+    assert archive.stat().st_mtime_ns == -1
+    policy = DiscoveryPolicy(include_patterns=("*.zip",), minimum_age_seconds=2)
+
+    result = _discover(root, policy, now_ns=-1 + 2_000_000_000 - 1)
+
+    assert result.healthy is True
+    assert result.candidates == ()
+    assert [(skip.code, skip.relative_path) for skip in result.skips] == [("too_young", "backup.zip")]
+
+
+def test_runtime_discovery_preserves_pre_epoch_mtime_and_fd_baseline(tmp_path: Path):
+    root = tmp_path / "approved"
+    source = root / "src"
+    source.mkdir(parents=True)
+    archive = source / "backup.zip"
+    archive.write_bytes(b"data")
+    os.utime(archive, ns=(-1, -1))
+    stat_result = archive.stat()
+    assert stat_result.st_mtime_ns == -1
+    before = len(os.listdir("/proc/self/fd"))
+
+    result = discover_completed_files(root, "src", DiscoveryPolicy(), now_ns=0)
+
+    assert result.healthy is True
+    assert result.non_authorizing is True
+    assert result.authorizing is False
+    assert len(result.candidates) == 1
+    assert result.candidates[0].mtime_ns == -1
+    assert result.candidates[0].fd is None
+    assert len(os.listdir("/proc/self/fd")) == before
+
+
 def test_empty_source_is_healthy_but_missing_source_is_public_error(tmp_path: Path):
     root = tmp_path / "approved"
     (root / "backups").mkdir(parents=True)
@@ -438,13 +493,25 @@ def test_public_observation_models_reject_mutable_or_authorizing_shapes():
 
 @pytest.mark.parametrize(
     "device,inode,byte_length,mtime_ns",
-    [(-1, 2, 0, 0), (1, -2, 0, 0), (True, 2, 0, 0), (1, False, 0, 0), (1, 2, -1, 0), (1, 2, 0, -1)],
+    [(-1, 2, 0, 0), (1, -2, 0, 0), (True, 2, 0, 0), (1, False, 0, 0), (1, 2, -1, 0)],
 )
 def test_candidate_rejects_malformed_identity_and_metadata(
     device: object, inode: object, byte_length: object, mtime_ns: object
 ):
     with pytest.raises(DiscoveryConfigError):
         DiscoveryCandidate("file.zip", device, inode, byte_length, mtime_ns)  # type: ignore[arg-type]
+
+
+def test_candidate_accepts_exact_negative_mtime():
+    candidate = DiscoveryCandidate("file.zip", 1, 2, 3, -1)
+
+    assert candidate.mtime_ns == -1
+
+
+@pytest.mark.parametrize("mtime_ns", [True, 1.5, "-1"])
+def test_candidate_rejects_non_integer_mtime(mtime_ns: object):
+    with pytest.raises(DiscoveryConfigError):
+        DiscoveryCandidate("file.zip", 1, 2, 3, mtime_ns)  # type: ignore[arg-type]
 
 
 def test_issue_constructor_rejects_unknown_or_non_generic_message():
