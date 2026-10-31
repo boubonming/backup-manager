@@ -11,8 +11,9 @@ import errno
 import ntpath
 import os
 import stat
+import threading
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Final
 
@@ -45,6 +46,12 @@ class CollisionStatus(str, Enum):
     MANAGED = "managed"
 
 
+class ClassificationDisposition(str, Enum):
+    """Disposition of a point-in-time check, never a write authorization."""
+
+    NON_AUTHORIZING = "non_authorizing"
+
+
 @dataclass(frozen=True, slots=True)
 class PathResolution:
     """An opened path object, or a planned but currently missing leaf.
@@ -57,16 +64,19 @@ class PathResolution:
     relative_path: str
     kind: str
     _fd: int | None
+    _close_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False, compare=False)
 
     @property
     def fd(self) -> int | None:
         return self._fd
 
     def close(self) -> None:
-        fd = self._fd
-        if fd is not None:
-            os.close(fd)
+        with self._close_lock:
+            fd = self._fd
+            if fd is None:
+                return
             object.__setattr__(self, "_fd", None)
+            os.close(fd)
 
     def __enter__(self) -> PathResolution:
         return self
@@ -81,17 +91,22 @@ class RootHandle:
 
     root_path: str
     _fd: int
+    _close_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False, compare=False)
 
     @property
     def fd(self) -> int:
-        if self._fd < 0:
-            raise ValueError("root handle is closed")
-        return self._fd
+        with self._close_lock:
+            if self._fd < 0:
+                raise ValueError("root handle is closed")
+            return self._fd
 
     def close(self) -> None:
-        if self._fd >= 0:
-            os.close(self._fd)
+        with self._close_lock:
+            fd = self._fd
+            if fd < 0:
+                return
             object.__setattr__(self, "_fd", -1)
+            os.close(fd)
 
     def __enter__(self) -> RootHandle:
         return self
@@ -122,7 +137,6 @@ class RootHandle:
                     if policy is FinalObjectPolicy.DIRECTORY:
                         _verify_directory(current, "relative_path")
                     return PathResolution(normalized, "directory", current)
-                os.close(current)
                 if policy is FinalObjectPolicy.MISSING_LEAF:
                     raise PathSafetyError("relative_path: final object already exists")
                 raise PathSafetyError("relative_path: final object is not a regular file")
@@ -154,6 +168,9 @@ class RootHandle:
         except OSError as exc:
             os.close(current)
             raise _component_error("relative_path", exc) from None
+        except BaseException:
+            os.close(current)
+            raise
         raise AssertionError("unreachable")
 
 
@@ -179,14 +196,18 @@ class DestinationOwner:
 
 @dataclass(frozen=True, slots=True)
 class DestinationOwnershipResult:
-    allowed: bool
+    """Point-in-time ownership classification; never durable write authorization."""
+
+    classification: ClassificationDisposition
     relative_path: str
     identity: tuple[int, int]
 
 
 @dataclass(frozen=True, slots=True)
 class SeparationResult:
-    allowed: bool
+    """Point-in-time separation classification; callers must revalidate before mutation."""
+
+    classification: ClassificationDisposition
     source_identity: tuple[int, int]
     destination_identity: tuple[int, int]
 
@@ -218,7 +239,9 @@ class ManagedOwnershipWitness:
 
 @dataclass(frozen=True, slots=True)
 class CollisionResult:
-    allowed: bool
+    """Point-in-time collision classification; it does not authorize a later write."""
+
+    classification: ClassificationDisposition
     status: CollisionStatus
     relative_path: str
     identity: tuple[int, int] | None
@@ -271,7 +294,11 @@ def validate_source_destination_separation(
                     destination_dir.fd, source_dir.fd
                 ):
                     raise PathOwnershipError("source and destination directories overlap")
-                return SeparationResult(True, source_identity, destination_identity)
+                return SeparationResult(
+                    ClassificationDisposition.NON_AUTHORIZING,
+                    source_identity,
+                    destination_identity,
+                )
 
 
 def validate_destination_ownership(
@@ -294,7 +321,11 @@ def validate_destination_ownership(
                         raise PathOwnershipError(
                             f"destination overlap: conflicting owner {owner.owner!r} at {owner.relative_path!r}"
                         )
-            return DestinationOwnershipResult(True, proposed, proposed_identity)
+            return DestinationOwnershipResult(
+                ClassificationDisposition.NON_AUTHORIZING,
+                proposed,
+                proposed_identity,
+            )
 
 
 def guard_destination_leaf(
@@ -315,7 +346,12 @@ def guard_destination_leaf(
                 fd = os.open(leaf, _PATH_FLAGS, dir_fd=parent_dir.fd)
             except OSError as exc:
                 if exc.errno == errno.ENOENT:
-                    return CollisionResult(True, CollisionStatus.MISSING, normalized, None)
+                    return CollisionResult(
+                        ClassificationDisposition.NON_AUTHORIZING,
+                        CollisionStatus.MISSING,
+                        normalized,
+                        None,
+                    )
                 raise _component_error("destination_relative_path", exc) from None
             try:
                 identity = _identity(fd)
@@ -329,7 +365,12 @@ def guard_destination_leaf(
                     and witness.destination_relative_path == normalized
                     and witness.identity == identity
                 ):
-                    return CollisionResult(True, CollisionStatus.MANAGED, normalized, identity)
+                    return CollisionResult(
+                        ClassificationDisposition.NON_AUTHORIZING,
+                        CollisionStatus.MANAGED,
+                        normalized,
+                        identity,
+                    )
                 raise PathOwnershipError("destination collision: existing object is unmanaged or changed")
             finally:
                 os.close(fd)
@@ -444,7 +485,11 @@ def _open_final_component(fd: int, component: str, policy: FinalObjectPolicy, no
         finally:
             os.close(existing_fd)
 
-    flags = _PATH_FLAGS if policy is FinalObjectPolicy.ANY_EXISTING else os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    flags = (
+        _PATH_FLAGS
+        if policy is FinalObjectPolicy.ANY_EXISTING
+        else os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    )
     if policy is FinalObjectPolicy.DIRECTORY:
         flags |= os.O_DIRECTORY
     try:
@@ -483,23 +528,32 @@ def _identity(fd: int | None) -> tuple[int, int]:
     return (info.st_dev, info.st_ino)
 
 
+_ANCESTRY_MAX_STEPS: int | None = None
+
+
 def _is_ancestor(ancestor_fd: int | None, candidate_fd: int | None) -> bool:
     if ancestor_fd is None or candidate_fd is None:
         return False
     wanted = _identity(ancestor_fd)
     current = os.dup(candidate_fd)
+    steps = 0
     try:
-        for _ in range(4096):
+        while True:
+            if _ANCESTRY_MAX_STEPS is not None and steps >= _ANCESTRY_MAX_STEPS:
+                raise PathSafetyError("ancestry traversal incomplete")
             if _identity(current) == wanted:
                 return True
-            parent = os.open("..", _DIR_FLAGS, dir_fd=current)
+            try:
+                parent = os.open("..", _DIR_FLAGS, dir_fd=current)
+            except OSError as exc:
+                raise _component_error("ancestry", exc) from None
             if _identity(parent) == _identity(current):
                 os.close(parent)
                 return False
             old = current
             current = parent
             os.close(old)
-        return False
+            steps += 1
     finally:
         os.close(current)
 
@@ -517,6 +571,7 @@ def _component_error(field: str, exc: OSError) -> PathSafetyError:
 __all__ = [
     "CollisionResult",
     "CollisionStatus",
+    "ClassificationDisposition",
     "DestinationOwner",
     "DestinationOwnershipResult",
     "FinalObjectPolicy",

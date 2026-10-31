@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import os
 import stat
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -21,6 +24,7 @@ from backup_manager.paths import (
     validate_destination_ownership,
     validate_source_destination_separation,
 )
+from backup_manager import paths as paths_module
 
 
 def test_normalize_relative_path_preserves_data_and_rejects_escapes():
@@ -158,7 +162,7 @@ def test_source_destination_separation_uses_filesystem_identity(tmp_path: Path):
     (destination / "same-prefix-2").mkdir()
 
     result = validate_source_destination_separation(source, destination, "same-prefix", "same-prefix-2")
-    assert result.allowed is True
+    assert result.classification is paths_module.ClassificationDisposition.NON_AUTHORIZING
     with pytest.raises(PathOwnershipError, match="overlap"):
         validate_source_destination_separation(source, source, ".", ".")
     nested_source = tmp_path / "nested-source"
@@ -180,14 +184,17 @@ def test_destination_ownership_rejects_component_aware_overlap_and_names_owner(t
     (root / "job" / "child").mkdir()
     assert validate_destination_ownership(
         root, "sibling", [DestinationOwner("job-1", "job"), DestinationOwner("job-2", "job-child")]
-    ).allowed
+    ).classification is paths_module.ClassificationDisposition.NON_AUTHORIZING
     for proposed, existing in [("job", "job/child"), ("job/child", "job"), ("job", "job")]:
         with pytest.raises(PathOwnershipError, match="conflicting owner 'job'"):
             validate_destination_ownership(root, proposed, [DestinationOwner("job", existing)])
     other_root = tmp_path / "other-root"
     other_root.mkdir()
     (other_root / "job").mkdir()
-    assert validate_destination_ownership(other_root, "job", []).allowed
+    assert (
+        validate_destination_ownership(other_root, "job", []).classification
+        is paths_module.ClassificationDisposition.NON_AUTHORIZING
+    )
 
 
 def test_destination_leaf_collision_guard_is_fail_closed_and_side_effect_free(tmp_path: Path):
@@ -197,7 +204,7 @@ def test_destination_leaf_collision_guard_is_fail_closed_and_side_effect_free(tm
     parent.mkdir()
     missing = guard_destination_leaf(root, "archives/new.tar")
     assert missing.status is CollisionStatus.MISSING
-    assert missing.allowed is True
+    assert missing.classification is paths_module.ClassificationDisposition.NON_AUTHORIZING
     assert not (parent / "new.tar").exists()
 
     managed = parent / "managed.tar"
@@ -206,7 +213,7 @@ def test_destination_leaf_collision_guard_is_fail_closed_and_side_effect_free(tm
     witness = ManagedOwnershipWitness("archives/./managed.tar", identity.st_dev, identity.st_ino, "job-1")
     allowed = guard_destination_leaf(root, "archives/managed.tar", witness)
     assert allowed.status is CollisionStatus.MANAGED
-    assert allowed.allowed is True
+    assert allowed.classification is paths_module.ClassificationDisposition.NON_AUTHORIZING
 
     for filename, make, witness_value in [
         ("file.tar", lambda p: p.write_text("unmanaged"), None),
@@ -242,3 +249,124 @@ def test_public_exception_hierarchy_and_immutable_records():
     owner = DestinationOwner("job", "a/b")
     with pytest.raises((AttributeError, TypeError)):
         owner.owner = "changed"
+
+
+@pytest.mark.parametrize("policy", [FinalObjectPolicy.REGULAR_FILE, FinalObjectPolicy.MISSING_LEAF])
+def test_root_dot_policy_failures_are_public_and_close_once(tmp_path: Path, policy: FinalObjectPolicy):
+    root = tmp_path / "root"
+    root.mkdir()
+    with open_trusted_root(root) as trusted:
+        before = len(os.listdir("/proc/self/fd"))
+        with pytest.raises(PathSafetyError):
+            trusted.resolve(".", policy)
+        assert len(os.listdir("/proc/self/fd")) == before
+
+
+def test_wrong_type_fifo_resolution_is_nonblocking_and_public(tmp_path: Path):
+    root = tmp_path / "root"
+    root.mkdir()
+    os.mkfifo(root / "pipe")
+    script = """
+import sys
+from backup_manager.paths import FinalObjectPolicy, PathSafetyError, open_trusted_root
+with open_trusted_root(sys.argv[1]) as trusted:
+    try:
+        trusted.resolve('pipe', FinalObjectPolicy.REGULAR_FILE)
+    except PathSafetyError:
+        raise SystemExit(0)
+raise SystemExit('FIFO was accepted')
+"""
+    env = {"PYTHONPATH": str(Path(__file__).parents[2] / "src")}
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(root)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=1,
+    )
+    assert completed.returncode == 0, completed.stderr or completed.stdout
+
+
+@pytest.mark.parametrize(
+    ("hook_error", "expected_error"),
+    [
+        (RuntimeError("hook"), RuntimeError),
+        (OSError("hook"), PathSafetyError),
+        (PathSafetyError("hook"), PathSafetyError),
+    ],
+)
+def test_hook_exceptions_release_all_owned_descriptors(
+    tmp_path: Path, hook_error: BaseException, expected_error: type[BaseException]
+):
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "file").write_text("data")
+
+    with open_trusted_root(root) as trusted:
+        before = len(os.listdir("/proc/self/fd"))
+
+        def fail(_parent_fd: int, _component: str, _index: int) -> None:
+            raise hook_error
+
+        with pytest.raises(expected_error):
+            trusted.resolve("file", FinalObjectPolicy.REGULAR_FILE, before_component_open=fail)
+        assert len(os.listdir("/proc/self/fd")) == before
+
+
+def test_path_resolution_close_is_safe_under_contention(tmp_path: Path):
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "file").write_text("data")
+    with open_trusted_root(root) as trusted:
+        with trusted.resolve("file", FinalObjectPolicy.REGULAR_FILE) as result:
+            with ThreadPoolExecutor(max_workers=32) as pool:
+                for _ in range(1000):
+                    list(pool.map(lambda _ignored: result.close(), range(8)))
+            assert result.fd is None
+
+
+def test_root_handle_close_is_safe_under_contention(tmp_path: Path):
+    root = tmp_path / "root"
+    root.mkdir()
+    trusted = open_trusted_root(root)
+    try:
+        with ThreadPoolExecutor(max_workers=32) as pool:
+            for _ in range(1000):
+                list(pool.map(lambda _ignored: trusted.close(), range(8)))
+        with pytest.raises(ValueError, match="closed"):
+            _ = trusted.fd
+    finally:
+        trusted.close()
+
+
+def test_results_are_explicitly_non_authorizing_classifications(tmp_path: Path):
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.mkdir()
+    destination.mkdir()
+    result = validate_source_destination_separation(source, destination, ".", ".")
+    assert result.classification is paths_module.ClassificationDisposition.NON_AUTHORIZING
+    assert not hasattr(result, "allowed")
+
+    leaf = destination / "leaf"
+    collision = guard_destination_leaf(destination, "leaf")
+    assert collision.classification is paths_module.ClassificationDisposition.NON_AUTHORIZING
+    assert not hasattr(collision, "allowed")
+    assert collision.relative_path == "leaf"
+    assert not leaf.exists()
+
+
+def test_ancestry_depth_exhaustion_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    ancestor = tmp_path / "ancestor"
+    candidate = tmp_path / "candidate"
+    ancestor.mkdir()
+    candidate.mkdir()
+    ancestor_fd = os.open(ancestor, os.O_RDONLY | os.O_DIRECTORY)
+    candidate_fd = os.open(candidate, os.O_RDONLY | os.O_DIRECTORY)
+    monkeypatch.setattr(paths_module, "_ANCESTRY_MAX_STEPS", 0, raising=False)
+    try:
+        with pytest.raises(PathSafetyError, match="ancestry"):
+            paths_module._is_ancestor(ancestor_fd, candidate_fd)
+    finally:
+        os.close(ancestor_fd)
+        os.close(candidate_fd)
