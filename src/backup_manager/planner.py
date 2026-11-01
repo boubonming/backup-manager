@@ -346,9 +346,27 @@ class RetentionPlan:
             raise PlannerValidationError("unmanaged: invalid destination entry")
         _integer(self.managed_count, "managed_count", minimum=0)
         _integer(self.managed_bytes, "managed_bytes", minimum=0)
-        _integer(self.keep_count, "keep_count", minimum=0)
+        _integer(self.keep_count, "keep_count", minimum=1)
         if type(self.blocked) is not bool:
             raise PlannerValidationError("blocked: must be a boolean")
+        if self.blocked != bool(self.issues):
+            raise PlannerValidationError("blocked: must match whether issues are present")
+        if self.blocked and (self.transfers or self.deletions):
+            raise PlannerValidationError("blocked: cannot contain proposed actions")
+        transfer_paths = tuple(action.destination_relative_path for action in self.transfers)
+        deletion_paths = tuple(action.destination_relative_path for action in self.deletions)
+        if len(transfer_paths) != len(set(transfer_paths)):
+            raise PlannerValidationError("transfers: destination paths must be unique")
+        if len(deletion_paths) != len(set(deletion_paths)):
+            raise PlannerValidationError("deletions: destination paths must be unique")
+        if set(transfer_paths) & set(deletion_paths):
+            raise PlannerValidationError("actions: transfer and deletion destinations overlap")
+        if self.managed_count == 0 and self.managed_bytes != 0:
+            raise PlannerValidationError("managed_bytes: inconsistent with managed_count")
+        if self.managed_count < len(self.deletions):
+            raise PlannerValidationError("managed_count: fewer records than deletions")
+        if self.managed_bytes < sum(action.identity.source_length for action in self.deletions):
+            raise PlannerValidationError("managed_bytes: fewer bytes than deletions")
         object.__setattr__(
             self,
             "lower_retention_confirmation_required",
@@ -508,7 +526,7 @@ def plan_retention(
         source_complete = observation.complete
         source_issues = observation.issues
 
-    keep = _integer(keep_count, "keep_count", minimum=0)
+    keep = _integer(keep_count, "keep_count", minimum=1)
     sources = _validate_records(source_records, "source_records", SourceIdentity)
     published = _validate_records(published_records, "published_records", PublishedDestination)
     tombstone_values = _validate_records(tombstones, "tombstones", Tombstone)
@@ -558,17 +576,27 @@ def plan_retention(
         item.job_owned,
     )))
     tombstone_keys = {item.identity_key for item in tombstone_values}
+    source_paths: dict[str, set[tuple[str, str, int]]] = {}
+    for item in sources:
+        source_paths.setdefault(item.source_relative_path, set()).add(item.identity_key)
+    for path, identities in source_paths.items():
+        if len(identities) > 1:
+            issues.add(PlannerIssue("destination_collision", path))
+
     source_by_key: dict[tuple[str, str, int], SourceIdentity] = {}
+    seen_source_records: dict[tuple[str, str, int], SourceIdentity] = {}
     tombstoned_sources: list[SourceIdentity] = []
     for item in sources:
-        if item.identity_key in tombstone_keys:
-            tombstoned_sources.append(item)
-            continue
-        prior = source_by_key.get(item.identity_key)
+        prior = seen_source_records.get(item.identity_key)
         if prior is None:
-            source_by_key[item.identity_key] = item
+            seen_source_records[item.identity_key] = item
+            if item.identity_key in tombstone_keys:
+                tombstoned_sources.append(item)
+            else:
+                source_by_key[item.identity_key] = item
         elif prior == item:
-            issues.add(PlannerIssue("duplicate_source", item.source_relative_path))
+            # Repeated byte-for-byte observations are one union member.
+            continue
         else:
             issues.add(PlannerIssue("conflicting_identity", item.source_relative_path))
 
@@ -585,7 +613,8 @@ def plan_retention(
         prior = published_by_key.get(item.identity_key)
         if prior is not None:
             if prior == item:
-                issues.add(PlannerIssue("duplicate_published", item.destination_relative_path))
+                # Repeated trusted publication records are one union member.
+                continue
             else:
                 issues.add(PlannerIssue("conflicting_identity", item.source_relative_path))
             continue
@@ -625,6 +654,25 @@ def plan_retention(
                 issues.add(PlannerIssue("destination_collision", observed.destination_relative_path))
             elif prior is None:
                 destination_by_path[observed.destination_relative_path] = observed
+
+    # A source path is also the implicit transfer destination.  Compare every
+    # source observation with every captured destination before retention
+    # selection so an older conflicting source cannot be hidden by keep_count.
+    for item in sources:
+        existing = destination_by_path.get(item.source_relative_path)
+        if existing is not None and (
+            existing.destination_sha256,
+            existing.destination_length,
+        ) != (item.source_sha256, item.source_length):
+            issues.add(
+                PlannerIssue(
+                    "unmanaged_collision" if not existing.job_owned else "destination_collision",
+                    item.source_relative_path,
+                )
+            )
+        publication = published_by_destination.get(item.source_relative_path)
+        if publication is not None and publication.identity_key != item.identity_key:
+            issues.add(PlannerIssue("destination_collision", item.source_relative_path))
 
     # A source and a trusted publication with one durable identity are one union
     # member.  A changed age observation is ambiguity, not an invitation to guess.

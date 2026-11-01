@@ -7,11 +7,14 @@ import pytest
 from backup_manager.planner import (
     DeleteAction,
     DestinationEntry,
+    PlannerIssue,
+    RetentionPlan,
     PlannerValidationError,
     PublishedDestination,
     SourceIdentity,
     SourceObservation,
     Tombstone,
+    TransferAction,
     plan_retention,
 )
 
@@ -55,10 +58,11 @@ def test_union_deduplicates_source_and_published_and_orders_pre_epoch_ties():
 
 def test_tombstones_prevent_recopy_and_are_never_delete_targets():
     item = source("gone.zip", _A, 4, 8)
-    result = plan_retention(1, (item,), (), (Tombstone("gone.zip", _A, 4),))
+    result = plan_retention(1, (item, item), (), (Tombstone("gone.zip", _A, 4),))
     assert result.transfers == ()
     assert result.retained == ()
     assert result.deletions == ()
+    assert len(result.skipped) == 1
     assert all(action.identity.source_sha256 != _A for action in result.deletions)
 
 
@@ -84,10 +88,10 @@ def test_empty_unhealthy_incomplete_or_issue_observation_suppresses_deletion():
         {"source_complete": False},
         {"source_issues": ("unresolved",)},
     ):
-        result = plan_retention(0, (), (published(existing),), **kwargs)
+        result = plan_retention(1, (), (published(existing),), **kwargs)
         assert result.deletions == ()
         assert result.deletion_authorized is False
-    healthy = plan_retention(0, (source("new.zip", _B, 1, 20),), (published(existing),))
+    healthy = plan_retention(1, (source("new.zip", _B, 1, 20),), (published(existing),))
     assert healthy.deletions == (DeleteAction(existing, "existing.zip"),)
 
 
@@ -125,6 +129,8 @@ def test_collisions_and_malformed_inputs_fail_closed():
     with pytest.raises(PlannerValidationError):
         plan_retention(True, (), ())
     with pytest.raises(PlannerValidationError):
+        plan_retention(0, (), ())
+    with pytest.raises(PlannerValidationError):
         plan_retention(1, [], ())
 
 
@@ -152,3 +158,127 @@ def test_results_are_immutable_and_permutations_have_identical_results():
         left.transfers = ()  # type: ignore[misc]
     with pytest.raises((FrozenInstanceError, AttributeError, TypeError)):
         left.transfers[0].identity.source_relative_path = "x"  # type: ignore[misc]
+
+
+def test_source_same_destination_different_content_blocks_before_keep_selection():
+    left = source("same.zip", _A, 1, 2)
+    right = source("same.zip", _B, 2, 1)
+    for keep_count, records in ((1, (left, right)), (1, (right, left)), (2, (left, right)), (2, (right, left))):
+        result = plan_retention(keep_count, records, ())
+        assert result.blocked is True
+        assert result.transfers == ()
+        assert result.deletions == ()
+        assert any(issue.relative_path == "same.zip" for issue in result.issues)
+
+
+def test_collisions_are_global_even_when_conflicting_source_is_not_retained():
+    old = source("same.zip", _A, 1, 1)
+    newest = source("newest.zip", _C, 1, 2)
+    conflicting_publication = PublishedDestination(
+        "other.zip", _B, 2, 3, "same.zip", _B, 2
+    )
+    published_result = plan_retention(1, (old, newest), (conflicting_publication,))
+    assert published_result.blocked is True
+    assert published_result.transfers == ()
+    assert published_result.deletions == ()
+
+    conflicting_unmanaged = DestinationEntry("same.zip", _B, 2, False)
+    unmanaged_result = plan_retention(
+        1,
+        (old, newest),
+        (),
+        destination_entries=(conflicting_unmanaged,),
+    )
+    assert unmanaged_result.blocked is True
+    assert unmanaged_result.transfers == ()
+    assert unmanaged_result.deletions == ()
+
+
+def test_exact_duplicate_source_observations_are_one_union_member():
+    item = source("same.zip", _A, 1, 2)
+    result = plan_retention(1, (item, item), ())
+    assert result.blocked is False
+    assert result.issues == ()
+    assert result.retained == (item,)
+    assert result.transfers == (TransferAction(item, "same.zip"),)
+
+
+def test_exact_duplicate_trusted_publications_are_one_union_member():
+    item = source("same.zip", _A, 1, 2)
+    publication = published(item)
+    result = plan_retention(1, (item,), (publication, publication))
+    assert result.blocked is False
+    assert result.issues == ()
+    assert result.transfers == ()
+    assert result.deletions == ()
+    assert result.managed_count == 1
+    assert result.managed_bytes == 1
+
+
+def test_contradictory_duplicate_source_and_published_records_block():
+    source_a = source("same.zip", _A, 1, 2)
+    source_observation = source("same.zip", _A, 1, 3)
+    source_result = plan_retention(1, (source_a, source_observation), ())
+    assert source_result.blocked is True
+    assert source_result.transfers == ()
+    assert source_result.deletions == ()
+    assert any(issue.code == "conflicting_identity" for issue in source_result.issues)
+
+    published_a = published(source_a)
+    published_observation = published(source_a, "other.zip")
+    published_result = plan_retention(1, (), (published_a, published_observation))
+    assert published_result.blocked is True
+    assert published_result.transfers == ()
+    assert published_result.deletions == ()
+    assert any(issue.code == "conflicting_identity" for issue in published_result.issues)
+
+    other = source("other.zip", _B, 2, 1)
+    collision_result = plan_retention(1, (), (published(source_a), published(other, "same.zip")))
+    assert collision_result.blocked is True
+    assert collision_result.transfers == ()
+    assert collision_result.deletions == ()
+    assert any(issue.code == "destination_collision" for issue in collision_result.issues)
+
+
+def test_same_timestamp_order_uses_path_then_complete_fingerprint():
+    first = source("a.zip", _B, 2, 10)
+    second = source("b.zip", _A, 1, 10)
+    result = plan_retention(2, (second, first), ())
+    assert result.retained == (first, second)
+
+
+def test_public_retention_plan_rejects_inconsistent_result_state():
+    issue = PlannerIssue("source_missing")
+    with pytest.raises(PlannerValidationError):
+        RetentionPlan((), (), (), (), (issue,), (), 0, 0, 1, False)
+
+    identity = source("same.zip")
+    transfer = TransferAction(identity, "same.zip")
+    deletion = DeleteAction(identity, "same.zip")
+    with pytest.raises(PlannerValidationError):
+        RetentionPlan((transfer,), (), (), (), (issue,), (), 0, 0, 1, True)
+    with pytest.raises(PlannerValidationError):
+        RetentionPlan((transfer, transfer), (), (), (), (), (), 0, 0, 1, False)
+    with pytest.raises(PlannerValidationError):
+        RetentionPlan((transfer,), (deletion,), (), (), (), (), 1, 1, 1, False)
+    with pytest.raises(PlannerValidationError):
+        RetentionPlan((), (), (), (), (), (), 0, 0, 0, False)
+
+
+def test_planner_purity_does_not_touch_external_services(monkeypatch):
+    import builtins
+    import os
+    import socket
+    import sqlite3
+    import time
+
+    def forbidden(*args: object, **kwargs: object) -> object:
+        raise AssertionError("planner attempted external access")
+
+    monkeypatch.setattr(builtins, "open", forbidden)
+    monkeypatch.setattr(os, "stat", forbidden)
+    monkeypatch.setattr(socket, "socket", forbidden)
+    monkeypatch.setattr(sqlite3, "connect", forbidden)
+    monkeypatch.setattr(time, "time", forbidden)
+    result = plan_retention(1, (source("new.zip"),), ())
+    assert result.transfers == (TransferAction(source("new.zip"), "new.zip"),)
