@@ -247,6 +247,20 @@ def test_same_timestamp_order_uses_path_then_complete_fingerprint():
     assert result.retained == (first, second)
 
 
+def test_same_path_timestamp_order_uses_sha_then_length_and_blocks_actions():
+    sha_first = source("same.zip", _A, 3, 10)
+    length_first = source("same.zip", _B, 2, 10)
+    length_second = source("same.zip", _B, 7, 10)
+    expected = (sha_first, length_first, length_second)
+
+    for records in ((length_second, length_first, sha_first), expected):
+        result = plan_retention(3, records, ())
+        assert result.blocked is True
+        assert result.transfers == ()
+        assert result.deletions == ()
+        assert result.retained == expected
+
+
 def test_public_retention_plan_rejects_inconsistent_result_state():
     issue = PlannerIssue("source_missing")
     with pytest.raises(PlannerValidationError):
@@ -263,6 +277,41 @@ def test_public_retention_plan_rejects_inconsistent_result_state():
         RetentionPlan((transfer,), (deletion,), (), (), (), (), 1, 1, 1, False)
     with pytest.raises(PlannerValidationError):
         RetentionPlan((), (), (), (), (), (), 0, 0, 0, False)
+
+
+def test_retention_plan_rejects_duplicate_deletion_destinations():
+    first = source("first.zip", _A, 10)
+    second = source("second.zip", _B, 10)
+    with pytest.raises(PlannerValidationError):
+        RetentionPlan(
+            (),
+            (DeleteAction(first, "same.zip"), DeleteAction(second, "same.zip")),
+            (),
+            (),
+            (),
+            (),
+            2,
+            20,
+            1,
+            False,
+        )
+
+
+def test_retention_plan_rejects_managed_aggregate_lower_bounds():
+    deletion = DeleteAction(source("deleted.zip", _A, 10), "deleted.zip")
+
+    with pytest.raises(PlannerValidationError):
+        RetentionPlan((), (deletion,), (), (), (), (), 0, 0, 1, False)
+    with pytest.raises(PlannerValidationError):
+        RetentionPlan((), (deletion,), (), (), (), (), 1, 9, 1, False)
+    with pytest.raises(PlannerValidationError):
+        RetentionPlan((), (), (), (), (), (), 0, 1, 1, False)
+
+
+@pytest.mark.parametrize("keep_count", [True, False])
+def test_retention_plan_rejects_boolean_keep_count(keep_count):
+    with pytest.raises(PlannerValidationError):
+        RetentionPlan((), (), (), (), (), (), 0, 0, keep_count, False)
 
 
 def test_planner_purity_does_not_touch_external_services(monkeypatch):
